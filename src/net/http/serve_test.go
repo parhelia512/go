@@ -878,6 +878,35 @@ func TestServerUnencryptedHTTP2HeaderTimeout(t *testing.T) {
 	}
 }
 
+func TestServerReadHeaderTimeoutIsCleared(t *testing.T) {
+	runSynctest(t, testServerReadHeaderTimeoutIsCleared,
+		testAddMode{http2UnencryptedMode})
+}
+func testServerReadHeaderTimeoutIsCleared(t *testing.T, mode testMode) {
+	const timeout = time.Second
+	cst := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+		w.WriteHeader(200)
+		NewResponseController(w).Flush()
+		time.Sleep(2 * timeout)
+		io.WriteString(w, "ok")
+	}), func(s *Server) {
+		s.ReadHeaderTimeout = timeout
+	}, optFakeNet)
+
+	res, err := cst.c.Get(cst.ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil {
+		t.Fatalf("reading response body after ReadHeaderTimeout: %v", err)
+	}
+	if want := "ok"; string(got) != want {
+		t.Fatalf("response body = %q, want %q", got, want)
+	}
+}
+
 func TestServerReadTimeout(t *testing.T) { run(t, testServerReadTimeout, http3SkippedMode) }
 func testServerReadTimeout(t *testing.T, mode testMode) {
 	respBody := "response body"
@@ -8118,4 +8147,35 @@ func TestServerConnectionReuse(t *testing.T) {
 			})
 		})
 	}
+}
+
+// A handler may close the request body itself. When it has not read the body
+// to EOF, Close drains the remainder; reaching the end of the body is the
+// expected outcome and must not be reported to the caller as an error.
+func TestServerRequestBodyCloseAfterPartialRead(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		closeErr := make(chan error, 1)
+		st := newHTTP1ServerTest(t, func(w ResponseWriter, req *Request) {
+			// Read part of the body, leaving the rest for Close to drain.
+			if _, err := io.ReadFull(req.Body, make([]byte, 2)); err != nil {
+				closeErr <- fmt.Errorf("reading request body: %v", err)
+				return
+			}
+			closeErr <- req.Body.Close()
+		})
+		conn := st.dial()
+		conn.writeMessage(
+			"POST / HTTP/1.1",
+			"Host: example.tld",
+			"Content-Length: 4",
+			"",
+			"test",
+		)
+		if got, want := conn.readResponse().StatusCode, 200; got != want {
+			t.Fatalf("got response %v, want %v", got, want)
+		}
+		if err := <-closeErr; err != nil {
+			t.Errorf("Request.Body.Close() = %v, want nil", err)
+		}
+	})
 }
